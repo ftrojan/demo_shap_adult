@@ -66,12 +66,15 @@ def get_probability_vector(prob):
     return prob1
 
 
-def evaluate_model(prob, ye):
+def evaluate_model(prob, ye, previous_ev=None):
     auc = sklearn.metrics.roc_auc_score(y_true=ye, y_score=prob)
     logging.info(f"AUC: {auc:.3f}")
-    return dict(
-        auc=auc,
-    )
+    if previous_ev is not None and 'auc' in previous_ev:
+        prev_auc = float(previous_ev['auc'])
+        ev = dict(auc=auc, delta_auc=auc - prev_auc)
+    else:
+        ev = dict(auc=auc)
+    return ev
 
 
 def get_feature_stats(f: pd.Series, y: pd.Series, bins) -> dict:
@@ -161,42 +164,31 @@ with st.form("train_form"):
         xt, xs, yt, ys = sklearn.model_selection.train_test_split(x, y, train_size=train_ratio, random_state=42)
         prep = Pipeline(preps[prep_name])
         classifier = classifiers[cls_name]
-        with st.expander("Evaluation"):
-            st.write(f"Preprocessing steps: {list(prep.named_steps.keys())}")
-            st.write(f"Classifier: {classifier}")
-            prep.fit(xt, yt)
-            feature_names = prep.named_steps['encode'].get_feature_names_out()
-            xp = prep.transform(xt)
-            logging.info(f"Preprocessed x: {xp.shape} with {np.mean(np.isnan(xp)):.1%} missing values")
-            logging.info(f"Preprocessed y: {yt.shape} with {np.mean(np.isnan(yt)):.1%} missing values")
-            model = classifier.fit(xp, yt)
-            xsp = prep.transform(xs)
-            prob = model.predict_proba(xsp)
-            prob1 = get_probability_vector(prob)
-            e = evaluate_model(prob1, ys)
-            if 'previous_auc' not in st.session_state:
-                st.metric(label="AUC", value=f"{e['auc']:.3f}")
-            else:
-                delta_auc = e['auc'] - st.session_state['previous_auc']
-                st.metric(label="AUC", value=f"{e['auc']:.3f}", delta=delta_auc)
-            st.session_state['previous_auc'] = e['auc']
-        with st.expander("Global Model Explanation (Shap)"):
-            explainer = shap.explainers.Tree(model, data=xsp)
-            logging.info(f"calculating Shap values for {len(xsp)} observations")
-            with st.spinner(text='Shap values in progress'):
-                sv = explainer.shap_values(xsp, ys)
-                st.success('Done')
-            logging.info(f"shap values: {sv[1].shape}")
-            fig, ax = plt.subplots()
-            if cls_name in ["DecisionTree", "RandomForest"]:
-                shap.summary_plot(sv[1], xsp, feature_names=feature_names, plot_type="layered_violin", color='coolwarm')
-                expected_value = explainer.expected_value[1]
-                svpos = sv[1]
-            else:
-                shap.summary_plot(sv, xsp, feature_names=feature_names, plot_type="layered_violin", color='coolwarm')
-                expected_value = explainer.expected_value
-                svpos = sv
-            st.pyplot(fig)
+        prep.fit(xt, yt)
+        feature_names = prep.named_steps['encode'].get_feature_names_out()
+        xp = prep.transform(xt)
+        logging.info(f"Preprocessed x: {xp.shape} with {np.mean(np.isnan(xp)):.1%} missing values")
+        logging.info(f"Preprocessed y: {yt.shape} with {np.mean(np.isnan(yt)):.1%} missing values")
+        model = classifier.fit(xp, yt)
+        xsp = prep.transform(xs)
+        prob = model.predict_proba(xsp)
+        prob1 = get_probability_vector(prob)
+        if 'model' in st.session_state and 'ev' in st.session_state['model']:
+            ev = evaluate_model(prob1, ys, previous_ev=st.session_state['model']['ev'])
+        else:
+            ev = evaluate_model(prob1, ys, previous_ev=None)
+        explainer = shap.explainers.Tree(model, data=xsp)
+        logging.info(f"calculating Shap values for {len(xsp)} observations")
+        with st.spinner(text='Shap values in progress'):
+            sv = explainer.shap_values(xsp, ys)
+            st.success('Done')
+        logging.info(f"shap values: {sv[1].shape}")
+        if cls_name in ["DecisionTree", "RandomForest"]:
+            expected_value = explainer.expected_value[1]
+            svpos = sv[1]
+        else:
+            expected_value = explainer.expected_value
+            svpos = sv
         st.session_state['model'] = dict(
             raw_data=xs.values,
             data=xsp,
@@ -205,11 +197,35 @@ with st.form("train_form"):
             expected_value=expected_value,
             shapley_values=svpos,
             feature_names=feature_names,
+            prep=prep,
+            classifier=classifier,
+            ev=ev,
         )
+if 'model' in st.session_state.keys():
+    m = st.session_state['model']
+    with st.expander("Evaluation"):
+        st.write(f"Preprocessing steps: {list(m['prep'].named_steps.keys())}")
+        st.write(f"Classifier: {m['classifier']}")
+        ev = m['ev']
+        if 'delta_auc' not in ev:
+            st.metric(label="AUC", value=f"{ev['auc']:.3f}")
+        else:
+            st.metric(label="AUC", value=f"{ev['auc']:.3f}", delta=ev['delta_auc'])
+    with st.expander("Global Model Explanation (Shap)"):
+        fig, ax = plt.subplots()
+        shap.summary_plot(
+            m['shapley_values'],
+            m['data'],
+            feature_names=m['feature_names'],
+            plot_type="layered_violin",
+            color='coolwarm',
+        )
+        st.pyplot(fig)
 st.write("# Model Serving")
 if 'model' in st.session_state.keys():
     m = st.session_state['model']
     examples = get_examples(m['prob'], m['target'])
+    st.write("Interesting observations to explore")
     st.write(examples)
     index_explain = st.number_input(
         "Observation to explain",
@@ -217,7 +233,10 @@ if 'model' in st.session_state.keys():
         min_value=0,
         max_value=len(m['prob']) - 1,
     )
-    st.write(f"Explaining predicted probability {m['prob'][index_explain]:.3f} for observation {index_explain}")
+    st.write((
+        f"Explaining predicted probability {m['prob'][index_explain]:.3f} "
+        f"with label {m['target'][index_explain]} for observation {index_explain}"
+    ))
     fig_explain, ax_explain = plt.subplots()
     e = Explanation(
         base_values=m['expected_value'],
